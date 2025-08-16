@@ -1,3 +1,4 @@
+# lepta/grammar/ast.py
 """Grammar AST
 - TokenDecl: %token PATTERN
 - IgnoreDecl: %ignore PATTERN
@@ -6,7 +7,7 @@
 
 from __future__     import annotations
 from dataclasses    import dataclass, field
-from typing         import List, Optional, Union, Dict
+from typing         import List, Optional, Union, Dict, Tuple
 
 @dataclass
 class Span:
@@ -95,7 +96,15 @@ class Group:
     expr: "Expr"
     span: Optional[Span] = None
 
-AtomKind = Union[Name, Lit, Group]
+@dataclass
+class PegExprRef:
+    """RHS용 국소 PEG 임베딩: @peg(Block.Rule)"""
+    block: str
+    rule: str
+    span: Optional[Span] = None
+
+
+AtomKind = Union[Name, Lit, Group, PegExprRef]
 
 # EBNF 표현 구조
 
@@ -126,12 +135,32 @@ class Rule:
     expr: Expr
     span: Optional[Span] = None
 
+# ====== PEG 통합용 노드
+
+@dataclass
+class PegBlockDecl:
+    """%peg NAME { ... };  — PEG 블록 원문을 그대로 보존"""
+    name: str
+    src: str    # 중괄호 내부 원문(문자 그대로)
+
+@dataclass
+class PegTokenDecl:
+    """%token NAME %peg(Block.Rule) [trigger='x'];  — PEG 기반 토큰"""
+    name: str
+    peg_ref: Tuple[str, str]           # (block_name, rule_name)
+    trigger: Optional[str] = None      # 단일 문자 트리거(선택)
+
+
 @dataclass
 class Grammar:
     # 선언(Decl) 섹션
     decl_tokens: List[TokenDecl] = field(default_factory=list)
     decl_ignores: List[IgnoreDecl] = field(default_factory=list)
     decl_keywords: List[KeywordDecl] = field(default_factory=list)
+
+    # PEG 선언
+    decl_peg_blocks: List[PegBlockDecl] = field(default_factory=list)
+    decl_peg_tokens: List[PegTokenDecl]  = field(default_factory=list)
     
     # 우선순위 선언
     decl_precedences: List[PrecedenceDecl] = field(default_factory=list)

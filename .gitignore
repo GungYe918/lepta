@@ -1,2 +1,12 @@
 # ignore tests
 tests/
+
+# ignore .vscode
+.vscode/
+
+# ignore __pycache__
+**/__pycache__/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

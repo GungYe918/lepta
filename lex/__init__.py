@@ -10,12 +10,16 @@
   - 키워드: 해당 리터럴 그대로 (예: "+", "(", ")")
   - %token: 토큰 이름 그대로 (예: "NUMBER")
 
-제한(MVP)
----------
-- 알파벳 키워드는 간단한 **단어 경계** 검사로 식별자와 구분 (예: "if("는 OK, "iffy"는 X)
-- 정규식은 Python `re`의 플래그만 지원: i, m, s, x, A (U는 무시)
-- 우선순위/길이동률 tie-breaker: **가장 긴 매치 > 먼저 선언된 토큰**
 
+매칭 순서:
+ 1) %ignore 패턴을 가능한 만큼 스킵
+  2) 키워드(리터럴) — **길이 내림차순(최장일치)**, 알파벳/유니코드 키워드는 단어경계 검사
+  3) PEG 토큰 — **최장일치**, 동률이면 선언 순서
+     - [trigger='x'] 지정 시 해당 문자로 시작할 때만 PEG 매칭 시도
+  4) %token 정규식 — **가장 긴 매치**(동률이면 선언 순서)
+  5) 둘 다 불일치 → SyntaxError
+
+  
 API
 ---
 - `LexTok(type: str, text: str, line: int, col: int)` — 토큰 단위
@@ -28,8 +32,27 @@ API
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Pattern
+from typing import List, Tuple, Optional, Pattern, Dict, TYPE_CHECKING
 import re
+
+
+# --- PEG 런타임 의존(프로젝트 내부 모듈) ---
+try:
+    # peg 모듈에서 노출된 공용 API를 사용합니다.
+    # 예상 인터페이스:
+    #   PegProgram.from_source(src: str, name: str|None=None) -> PegProgram
+    #   PegRunner(prog: PegProgram).run(rule: str, text: str, pos: int) -> tuple[bool, int]
+    from ..peg import PegRunner  # type: ignore
+    _HAS_PEG = True
+except Exception:
+    PegRunner = object   # type: ignore
+    _HAS_PEG = False
+
+if TYPE_CHECKING:
+    from ..peg import PegProgram as _PegProgram
+else:
+    class _PegProgram:  # 런타임 더미
+        pass
 
 
 try:
@@ -100,6 +123,15 @@ def _compile_regex(pat: str, flags: str) -> Pattern[str]:
         f |= _FLAG_MAP.get(ch, 0)
     return re.compile(pat, f)
 
+# --------- PEG 토큰 룰 ---------
+
+@dataclass(frozen=True)
+class _PegTokenRule:
+    term: str
+    block: str
+    rule: str
+    trigger: Optional[str]  # 첫 글자 트리거(선택)
+
 # --------- Core implementation ---------
 
 class SimpleLexer(Lexer):
@@ -107,6 +139,7 @@ class SimpleLexer(Lexer):
     SimpleLexer
     ===========
     Grammar의 선언부를 사용해 작동하는 참조 구현.
+    (키워드 => PEG => 정규식)
 
     매칭 순서:
       1) %ignore 패턴을 가능한 만큼 스킵
@@ -115,29 +148,72 @@ class SimpleLexer(Lexer):
       4) 둘 다 불일치 → SyntaxError
     """
     def __init__(self,
-                 keywords: List[str],
-                 tokens: List[Tuple[str, Pattern[str]]],
-                 ignores: List[Pattern[str]]):
-        self._keywords = keywords[:]         # 리터럴 문자열
-        self._tokens = tokens[:]             # (name, compiled_regex)
-        self._ignores = ignores[:]           # compiled_regex
-        self._text = ""
-        self._i = 0
-        self._line = 1
-        self._col = 1
-        self._peek_cache: Optional[LexTok] = None
+            keywords: List[str],
+            tokens: List[Tuple[str, Pattern[str]]],
+            ignores: List[Pattern[str]],
+            peg_programs: Optional[Dict[str, "_PegProgram"]] = None,
+            peg_rules: Optional[List["_PegTokenRule"]] = None):
+            self._keywords = keywords[:]         # 리터럴 문자열
+            self._tokens = tokens[:]             # (name, compiled_regex)
+            self._ignores = ignores[:]           # compiled_regex
+            self._peg_programs = dict(peg_programs or {})
+            self._peg_rules = list(peg_rules or [])
+            self._text = ""
+            self._i = 0
+            self._line = 1
+            self._col = 1
+            self._peek_cache: Optional[LexTok] = None
 
     # ---- Constructors ----
     @classmethod
     def from_grammar(cls, g) -> "SimpleLexer":
         """Grammar(AST)의 선언부로부터 렉서를 생성."""
-        keywords = [kw.lexeme for kw in getattr(g, "decl_keywords", [])]
+        # 1) 키워드: 중복 제거(선언 첫 등장만 유지) + 길이 내림차순(동길이면 선언 순서)
+        raw_kws = [kw.lexeme for kw in getattr(g, "decl_keywords", [])]
+        seen = set()
+        kws_pairs = []
+        for idx, lit in enumerate(raw_kws):
+            if lit in seen:
+                continue
+            seen.add(lit)
+            kws_pairs.append((lit, idx))
+        kws_pairs.sort(key=lambda p: (-len(p[0]), p[1]))
+        keywords = [lit for (lit, _idx) in kws_pairs]
+
+        # 2) %token 정규식
         tokens: List[Tuple[str, Pattern[str]]] = []
         for td in getattr(g, "decl_tokens", []):
             tokens.append((td.name, _compile_regex(td.pattern, td.flags or "")))
-        ignores = [_compile_regex(ig.pattern, ig.flags or "") for ig in getattr(g, "decl_ignores", [])]
-        return cls(keywords, tokens, ignores)
 
+        # 3) %ignore
+        ignores = [_compile_regex(ig.pattern, ig.flags or "") for ig in getattr(g, "decl_ignores", [])]
+
+        # 4) PEG 프로그램/룰
+        peg_programs: Dict[str, "_PegProgram"] = {}
+        peg_rules: List[_PegTokenRule] = []
+        if _HAS_PEG:
+            # 지역 import로 런타임 의존성을 최소화
+            from ..peg import PegProgram  # type: ignore
+            # %peg 블록 컴파일
+            for pb in getattr(g, "decl_peg_blocks", []):
+                try:
+                    prog = PegProgram.from_source(pb.src)
+                except Exception as e:
+                    raise SyntaxError(f"PEG block '{pb.name}' compile error: {e}")
+                peg_programs[pb.name] = prog  # block name -> program
+            # %token ... %peg(Block.Rule) [trigger='x']
+            for pt in getattr(g, "decl_peg_tokens", []):
+                block, rule = pt.peg_ref
+                trig = pt.trigger if pt.trigger else None
+                peg_rules.append(_PegTokenRule(term=pt.name, block=block, rule=rule, trigger=trig))
+        else:
+            # PEG 런타임이 없는데 PEG 토큰이 선언되면 바로 실패시켜 안내
+            if getattr(g, "decl_peg_tokens", []):
+                raise RuntimeError("PEG runtime is not available but PEG tokens were declared.")
+
+        return cls(keywords, tokens, ignores, peg_programs, peg_rules)
+
+    
     # ---- Input binding ----
     def reset(self, text: str, *, line: int = 1, col: int = 1) -> None:
         self._text = text
@@ -190,7 +266,7 @@ class SimpleLexer(Lexer):
     def _match_keyword(self) -> Optional[LexTok]:
         s = self._text
         i = self._i
-        for lit in self._keywords:
+        for lit in self._keywords:  # 이미 길이 내림차순으로 정렬됨
             if not s.startswith(lit, i):
                 continue
             # 유니코드 '단어 키워드'는 경계 검사(앞/뒤).
@@ -212,6 +288,41 @@ class SimpleLexer(Lexer):
                     continue
             return LexTok(type=lit, text=lit, line=self._line, col=self._col)
         return None
+    
+    def _peg_try_match(self) -> Optional[LexTok]:
+        """선언부 %token … %peg(Block.Rule) 항목을 트리거 기반으로 국소 매칭."""
+        if not self._peg_rules:
+            return None
+        text = self._text
+        i = self._i
+        best_len = -1
+        best_term: Optional[str] = None
+
+        for r in self._peg_rules:
+            # 트리거가 있으면 첫 글자 일치할 때만 시도(광범위 백트래킹 방지)
+            if r.trigger is not None:
+                if i >= len(text) or text[i] != r.trigger:
+                    continue
+            prog = self._peg_programs.get(r.block)
+            if prog is None:
+                continue
+
+            try:
+                ok, end = PegRunner(prog).run(r.rule, text, i)  # ← 실제 시그니처
+            except Exception:
+                ok, end = (False, i)
+
+            if ok and end > i:
+                l = end - i
+                if l > best_len:
+                    best_len = l
+                    best_term = r.term
+
+        if best_len > 0 and best_term is not None:
+            lexeme = text[i:i+best_len]
+            return LexTok(type=best_term, text=lexeme, line=self._line, col=self._col)
+        return None
+
 
     def _match_token_regex(self) -> Optional[LexTok]:
         rest = self._text[self._i:]
@@ -238,18 +349,28 @@ class SimpleLexer(Lexer):
         if self._i >= len(self._text):
             return None
 
+        # 1) 키워드
         kw = self._match_keyword()
         if kw is not None:
             self._advance_text(kw.text)
             return kw
 
+        # 2) PEG 토큰(국소, 트리거 기반, 최장일치)
+        peg = self._peg_try_match()
+        if peg is not None:
+            self._advance_text(peg.text)
+            return peg
+
+        # 3) 정규식 토큰(최장일치)
         tk = self._match_token_regex()
         if tk is not None:
             self._advance_text(tk.text)
             return tk
 
+        # 실패
         ch = self._text[self._i]
         raise SyntaxError(f"Lexing error: unexpected character {ch!r} at {self._line}:{self._col}")
+
 
 # Convenience
 def build_lexer_from_grammar(g) -> SimpleLexer:

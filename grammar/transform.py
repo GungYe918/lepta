@@ -49,6 +49,79 @@ def _expand_precedence(g: Grammar) -> List[PrecedenceDecl]:
         out.append(d)
     return out
 
+# --- NEW: inline PEG on RHS -> global PEG token lowering ---------------------
+
+def _canon_peg_term_name(block: str, rule: str, taken: set[str]) -> str:
+    """인라인 @peg(Block.Rule)용 고유 토큰 이름 생성.
+    - 기본: __peg_{Block}_{Rule}
+    - 중복 시: __peg_{Block}_{Rule}__N
+    """
+    base = f"__peg_{block}_{rule}"
+    name = base
+    n = 1
+    while name in taken:
+        n += 1
+        name = f"{base}__{n}"
+    return name
+
+def lower_inline_peg_to_tokens(g: Grammar) -> Grammar:
+    """
+    Grammar 안의 RHS `@peg(Block.Rule)`(PegExprRef)들을 전부
+    '전역 PEG 토큰'으로 치환한다.
+      - decl_peg_tokens에 (block, rule, trigger) 쌍을 추가(중복 제거)
+      - 규칙 RHS의 PegExprRef → Name(peg_token_name) 으로 교체
+    """
+    # 0) 기존 PEG 토큰/블록 인덱스화
+    taken_names = {t.name for t in g.decl_tokens} \
+                | {kw.lexeme for kw in g.decl_keywords} \
+                | {pt.name for pt in g.decl_peg_tokens}
+    have_block: dict[str, str] = {pb.name: pb.src for pb in getattr(g, "decl_peg_blocks", [])}
+
+    # (block, rule, trigger) -> token name
+    ref2name: dict[tuple[str, str, str | None], str] = {}
+    for pt in getattr(g, "decl_peg_tokens", []):
+        key = (pt.peg_ref[0], pt.peg_ref[1], pt.trigger)
+        ref2name[key] = pt.name
+
+    # 1) 규칙을 순회하며 PegExprRef를 찾고 치환
+    def _rewrite_atom(a: Atom) -> Atom:
+        node = a.node
+        if isinstance(node, PegExprRef):
+            b, r = node.block, node.rule
+            trig = getattr(node, "trigger", None)  # <-- 하위호환: 없으면 None
+            # 블록 존재 확인
+            if b not in have_block:
+                raise SyntaxError(f"Inline @peg references unknown %peg block '{b}'")
+            key = (b, r, trig)
+            tok = ref2name.get(key)
+            if tok is None:
+                tok = _canon_peg_term_name(b, r, taken_names)
+                taken_names.add(tok)
+                g.decl_peg_tokens.append(PegTokenDecl(name=tok, peg_ref=(b, r), trigger=trig))
+                ref2name[key] = tok
+            return Atom(node=Name(tok), suffix=a.suffix, span=a.span)
+        elif isinstance(node, Group):
+            # 그룹 내부 재귀 치환
+            new_alts: list[Seq] = []
+            for s in node.expr.alts:
+                new_items = [_rewrite_atom(it) for it in s.items]
+                new_alts.append(Seq(items=new_items, prec=s.prec))
+            return Atom(node=Group(Expr(new_alts)), suffix=a.suffix, span=a.span)
+        else:
+            return a
+
+    for i, rule in enumerate(g.rules):
+        new_alts: list[Seq] = []
+        for s in rule.expr.alts:
+            new_items = [_rewrite_atom(it) for it in s.items]
+            new_alts.append(Seq(items=new_items, prec=s.prec))
+        g.rules[i] = Rule(name=rule.name, expr=Expr(new_alts), span=rule.span)
+
+    return g
+
+
+
+
 
 class _Lowering:
     def __init__(self, g: Grammar) :
@@ -59,8 +132,10 @@ class _Lowering:
         self._grp_id = 0
         self._rep_id = 0
         self._opt_id = 0
-        # 토큰 이름 목록(단말 취급)
-        self.token_terms: Set[str] = {t.name for t in g.decl_tokens}
+        # 토큰 이름 목록(단말 취급): %token + %token ... %peg(...)
+        self.token_terms: Set[str] = {t.name for t in g.decl_tokens} | {
+            pt.name for pt in getattr(g, "decl_peg_tokens", [])
+        }
         # 키워드 리터럴(단말)
         for kw in g.decl_keywords:
             self.terms.add(kw.lexeme)
@@ -102,12 +177,25 @@ class _Lowering:
             self.terms.add(node.text)
             return [node.text]
         elif isinstance(node, Group):
-            # 그룹을 새 비단말로 치환하고 그 비단말 반환
             grp_name = self._new_grp()
             self._lower_expr_into(grp_name, node.expr)
             return [grp_name]
+        elif isinstance(node, PegExprRef):
+            # 안전망: 로워링이 선행되지 않았다면 여기서도 치환
+            b, r = node.block, node.rule
+            trig = getattr(node, "trigger", None)  # <-- 하위호환
+            # 토큰 이름 충돌 회피
+            exist = {t.name for t in self.g.decl_peg_tokens} | self.token_terms | self.terms | self.nonterms
+            tok = _canon_peg_term_name(b, r, exist)
+            # 전역 PEG 토큰 등록(중복 방지)
+            if tok not in {pt.name for pt in self.g.decl_peg_tokens}:
+                self.g.decl_peg_tokens.append(PegTokenDecl(name=tok, peg_ref=(b, r), trigger=trig))
+                self.token_terms.add(tok)
+            self.terms.add(tok)
+            return [tok]
         else:
             raise TypeError("unknown Atom.node")
+
         
     
     def _lower_seq_atoms(self, atoms: List[Atom]) -> List[str]:
@@ -173,4 +261,7 @@ class _Lowering:
 
 def to_bnf(g: Grammar) -> BNF:
     """Grammar(AST) → BNF(프로덕션 목록, 단말/비단말 집합)"""
+    # 1) RHS 인라인 PEG → 전역 PEG 토큰으로 치환
+    g = lower_inline_peg_to_tokens(g)
+    # 2) 통상 EBNF → BNF 전개
     return _Lowering(g).lower()

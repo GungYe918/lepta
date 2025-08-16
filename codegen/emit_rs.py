@@ -213,20 +213,491 @@ def _escape_rs(s: str) -> str:
     """Rust 문자열 리터럴 이스케이프."""
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
+def _escape_rs_char(ch: str) -> str:
+    """Rust 단일 문자 리터럴용 이스케이프."""
+    if ch == "'":
+        return "\\'"
+    if ch == "\\":
+        return "\\\\"
+    # 일반 ASCII 제어문자들 처리(필요 최소)
+    if ch == "\n":
+        return "\\n"
+    if ch == "\r":
+        return "\\r"
+    if ch == "\t":
+        return "\\t"
+    return ch
+
+def _peg_parse_min(src: str):
+    """
+    매우 작은 PEG 파서(코드생성 전용).
+    지원 요소: Literal('..'), CharClass([...]), Any(.), Seq, Choice(/),
+              Repeat(* + ?), Group(()), Not(!), Ref(IDENT)
+    문법:  Rule <- expr
+    반환: {"rules": dict[name -> node]}
+    node: dict 형태로 k 키로 구분
+      - {"k":"lit","s":str}
+      - {"k":"any"}
+      - {"k":"class","neg":bool,"items":[("ch",ch)|("range",a,b), ...]}
+      - {"k":"seq","items":[node,...]}
+      - {"k":"choice","alts":[node,...]}
+      - {"k":"rep","op":"*|+|?","node":node}
+      - {"k":"not","node":node}
+      - {"k":"ref","name":str}
+    """
+    i, n = 0, len(src)
+
+    def peek():
+        return src[i] if i < n else ""
+
+    def eat():
+        nonlocal i
+        ch = src[i] if i < n else ""
+        i += 1
+        return ch
+
+    def skip_ws():
+        nonlocal i
+        while i < n and src[i] in " \t\r\n":
+            i += 1
+
+    def parse_ident():
+        nonlocal i
+        skip_ws()
+        j = i
+        if i < n and (src[i].isalpha() or src[i] == "_"):
+            i += 1
+            while i < n and (src[i].isalnum() or src[i] == "_"):
+                i += 1
+            return src[j:i]
+        return None
+
+    def parse_lit():
+        skip_ws()
+        if peek() != "'":
+            return None
+        eat()  # '
+        out = []
+        while True:
+            ch = eat()
+            if ch == "":
+                raise SyntaxError("Unterminated literal in %peg block")
+            if ch == "\\":
+                # 간단 이스케이프 처리 (\' \\)
+                esc = eat()
+                if esc == "":
+                    raise SyntaxError("Bad escape in literal")
+                if esc == "n":
+                    out.append("\n")
+                elif esc == "r":
+                    out.append("\r")
+                elif esc == "t":
+                    out.append("\t")
+                else:
+                    out.append(esc)
+                continue
+            if ch == "'":
+                break
+            out.append(ch)
+        return {"k": "lit", "s": "".join(out)}
+
+    def parse_class():
+        skip_ws()
+        if peek() != "[":
+            return None
+        eat()  # [
+        neg = False
+        if peek() == "^":
+            eat()
+            neg = True
+        items = []
+        def read_char():
+            ch = eat()
+            if ch == "":
+                raise SyntaxError("Unterminated char class")
+            if ch == "\\":
+                esc = eat()
+                if esc == "":
+                    raise SyntaxError("Bad escape in char class")
+                if esc == "n":
+                    return "\n"
+                if esc == "r":
+                    return "\r"
+                if esc == "t":
+                    return "\t"
+                return esc
+            return ch
+        while True:
+            if peek() == "]":
+                eat()
+                break
+            a = read_char()
+            if peek() == "-" and src[i+1:i+2] not in ("", "]"):
+                eat()  # '-'
+                b = read_char()
+                items.append(("range", a, b))
+            else:
+                items.append(("ch", a))
+        return {"k": "class", "neg": neg, "items": items}
+
+    def parse_any():
+        skip_ws()
+        if peek() == ".":
+            eat()
+            return {"k": "any"}
+        return None
+
+    def parse_primary():
+        skip_ws()
+        if peek() == "(":
+            eat()
+            e = parse_expr()
+            skip_ws()
+            if peek() != ")":
+                raise SyntaxError("Expected ')' in %peg group")
+            eat()
+            return e
+        if peek() == "!":
+            eat()
+            sub = parse_primary()
+            return {"k": "not", "node": sub}
+        lit = parse_lit()
+        if lit:
+            return lit
+        cls = parse_class()
+        if cls:
+            return cls
+        anyx = parse_any()
+        if anyx:
+            return anyx
+        ident = parse_ident()
+        if ident:
+            return {"k": "ref", "name": ident}
+        return None
+
+    def parse_suffix(node):
+        skip_ws()
+        if peek() in ("*", "+", "?"):
+            op = eat()
+            return {"k": "rep", "op": op, "node": node}
+        return node
+
+    def parse_seq():
+        nonlocal i
+        skip_ws()
+        items = []
+        while True:
+            save = i
+            if peek() in (")", "/", ""):
+                break
+            p = parse_primary()
+            if not p:
+                i = save
+                break
+            items.append(parse_suffix(p))
+            skip_ws()
+            if peek() in (")", "/", ""):
+                break
+        if not items:
+            # 빈 시퀀스는 ε 허용(여기선 {'k':'seq','items':[]}로 표기)
+            return {"k": "seq", "items": []}
+        return {"k": "seq", "items": items}
+
+    def parse_expr():
+        left = parse_seq()
+        skip_ws()
+        alts = [left]
+        while peek() == "/":
+            eat()
+            alts.append(parse_seq())
+            skip_ws()
+        if len(alts) == 1:
+            return left
+        return {"k": "choice", "alts": alts}
+
+    # Rules
+    rules = {}
+    while True:
+        skip_ws()
+        if i >= n:
+            break
+        name = parse_ident()
+        if not name:
+            # 빈 줄 등 스킵
+            if i < n:
+                # 예외: 주석 등은 미지원. 입력이 남았는데 식별자 아니면 에러.
+                raise SyntaxError("Expected rule name in %peg block")
+            break
+        skip_ws()
+        # '<-'
+        if not (peek() == "<" and src[i+1:i+2] == "-"):
+            raise SyntaxError("Expected '<-' after rule name in %peg block")
+        i += 2
+        expr = parse_expr()
+        rules[name] = expr
+        skip_ws()
+    return {"rules": rules}
+
+
+
+def _peg_emit_rust_from_blocks(ast) -> str:
+    """
+    Grammar AST의 %peg 블록과 %token ... %peg(Block.Rule)들을 사용하여,
+    러스트 측에서 **백트래킹 가능한** PEG 런타임(전용 함수들)을 생성한다.
+
+    - 각 Block.Rule에 대해: fn peg_<Block>_<Rule>(s:&str, pos:usize)->Option<usize>
+    - 필요 헬퍼:
+        next_char, eat_lit, (클래스 검사 inline)
+    - PEG 토큰 테이블: PEG_SPECS: &[PegSpec] (name, trigger, func)
+
+    반환: 러스트 코드 문자열(모듈 스코프에 그대로 삽입됨)
+    """
+
+    # 1) 사용되는 (block, rule, trigger, term) 수집
+    peg_tokens = []
+    for pt in getattr(ast, "decl_peg_tokens", []):
+        b, r = pt.peg_ref
+        trig = getattr(pt, "trigger", None) or None
+        peg_tokens.append((pt.name, b, r, trig))
+
+    if not peg_tokens:
+        return ""  # PEG 미사용 시 빈 문자열
+
+    # 2) 블록 소스 맵
+    block_src: dict[str, str] = {pb.name: pb.src for pb in getattr(ast, "decl_peg_blocks", [])}
+
+    # 3) 블록별 파싱/코드생성
+    parsed_blocks: dict[str, dict] = {}
+    for _term, b, _r, _tr in peg_tokens:
+        if b not in block_src:
+            raise SyntaxError(f"emit_rs: %peg block '{b}' not found for PEG token")
+        if b not in parsed_blocks:
+            parsed_blocks[b] = _peg_parse_min(block_src[b])
+
+    # 4) 코드 제너레이터: 노드 → 러스트 Option<usize> 표현 생성
+    tmp_id = {"n": 0}
+
+    def new_tmp(prefix="p"):
+        tmp_id["n"] += 1
+        return f"{prefix}{tmp_id['n']}"
+
+    def emit_class_pred(cls):
+        conds = []
+        for kind, *rest in cls["items"]:
+            if kind == "ch":
+                ch = _escape_rs_char(rest[0])
+                conds.append(f"ch == '{ch}'")
+            elif kind == "range":
+                a, b = rest
+                a = _escape_rs_char(a)
+                b = _escape_rs_char(b)
+                conds.append(f"('{a}' <= ch && ch <= '{b}')")
+        in_set = " || ".join(conds) if conds else "false"
+        return f"!({in_set})" if cls["neg"] else f"({in_set})"
+
+    def emit_expr(block, node, pos_expr: str) -> str:
+        k = node["k"]
+
+        if k == "lit":
+            lit = _escape_rs(node["s"])
+            return (
+                f"(if s[{pos_expr}..].starts_with(\"{lit}\") "
+                f"{{ Some({pos_expr} + \"{lit}\".len()) }} else {{ None }})"
+            )
+
+        if k == "any":
+            return (
+                "{ "
+                f"let mut iter = s[{pos_expr}..].chars(); "
+                "if let Some(ch) = iter.next() { "
+                "let adv = ch.len_utf8(); "
+                f"Some({pos_expr} + adv) "
+                "} else { None } "
+                "}"
+            )
+
+        if k == "class":
+            pred = emit_class_pred(node)
+            return (
+                "{ "
+                f"let mut iter = s[{pos_expr}..].chars(); "
+                "if let Some(ch) = iter.next() { "
+                f"if {pred} {{ Some({pos_expr} + ch.len_utf8()) }} else {{ None }} "
+                "} else { None } "
+                "}"
+            )
+
+        if k == "ref":
+            fname = f"peg_{block}_{node['name']}"
+            return f"{fname}(s, {pos_expr})"
+
+        if k == "not":
+            inner = emit_expr(block, node["node"], pos_expr)
+            # 부정 전방탐색: 성공하면 실패, 실패하면 현재 위치 유지로 성공
+            return (
+                "{ "
+                f"if {inner}.is_some() {{ None }} else {{ Some({pos_expr}) }} "
+                "}"
+            )
+
+        if k == "rep":
+            op = node["op"]
+            inner_cl = new_tmp("e")
+            inner_code = emit_expr(block, node["node"], inner_cl)
+
+            if op == "*":
+                p = new_tmp("p")
+                pprev = new_tmp("pp")
+                return (
+                    "{ "
+                    f"let mut {p} = {pos_expr}; "
+                    "loop { "
+                    f"let {pprev} = {p}; "
+                    f"let {inner_cl} = {p}; "
+                    f"match {inner_code} {{ "
+                    f"    Some(npos) => {{ {p} = npos; if {p} == {pprev} {{ break; }} }} "
+                    "    None => break "
+                    "} } "
+                    f"Some({p}) "
+                    "}"
+                )
+
+            if op == "+":
+                p = new_tmp("p")
+                pprev = new_tmp("pp")
+                first = new_tmp("pf")
+                return (
+                    "{ "
+                    f"let mut {p} = {pos_expr}; "
+                    f"let {first} = {{ "
+                    f"    let {inner_cl} = {p}; "
+                    f"    match {inner_code} {{ Some(npos) => npos, None => return None }} "
+                    "}; "
+                    f"{p} = {first}; "
+                    "loop { "
+                    f"    let {pprev} = {p}; "
+                    f"    let {inner_cl} = {p}; "
+                    f"    match {inner_code} {{ "
+                    f"        Some(npos) => {{ {p} = npos; if {p} == {pprev} {{ break; }} }} "
+                    "        None => break "
+                    "    } } "
+                    f"Some({p}) "
+                    "}"
+                )
+
+            if op == "?":
+                tmp = new_tmp("p")
+                return (
+                    "{ "
+                    f"let {tmp} = {pos_expr}; "
+                    f"let res = {emit_expr(block, node['node'], tmp)}; "
+                    f"match res {{ Some(npos) => Some(npos), None => Some({pos_expr}) }} "
+                    "}"
+                )
+
+            raise ValueError("unknown rep op")
+
+        if k == "seq":
+            items = node.get("items", [])
+            if not items:
+                return f"Some({pos_expr})"
+            cur = new_tmp("p")
+            parts = [f"{{ let mut {cur} = {pos_expr}; "]
+            for it in items:
+                scratch = new_tmp("pp")
+                expr_code = emit_expr(block, it, scratch)
+                parts.append(f"let {scratch} = {cur}; ")
+                parts.append(f"match {expr_code} {{ Some(npos) => {{ {cur} = npos; }}, None => return None }} ")
+            parts.append(f"Some({cur}) }}")
+            return "".join(parts)
+
+        if k == "choice":
+            alts = node["alts"]
+            parts = ["{ "]
+            for a in alts:
+                parts.append(f"if let Some(npos) = {emit_expr(block, a, pos_expr)} {{ return Some(npos); }} ")
+            parts.append("None }")
+            return "".join(parts)
+
+        raise ValueError(f"unknown PEG node kind: {k}")
+
+    # 5) 필요한 rule set 수집(참조 포함)
+    rust_funcs: list[str] = []
+    for bname, parsed in parsed_blocks.items():
+        rules = parsed["rules"]
+        for rname, expr in rules.items():
+            body = emit_expr(bname, expr, "pos")
+            fn = (
+                f"#[allow(unused_parens)]\n"
+                f"fn peg_{bname}_{rname}(s: &str, pos: usize) -> Option<usize> {{ "
+                f"{body} "
+                "}\n"
+            )
+            rust_funcs.append(fn)
+
+    # 6) PEG_SPECS 테이블 생성
+    spec_rows = []
+    for term, b, r, trig in peg_tokens:
+        trig_rs = "None" if not trig else f"Some('{_escape_rs_char(trig)}')"
+        spec_rows.append(
+            f'PegSpec {{ name: "{_escape_rs(term)}", trigger: {trig_rs}, func: peg_{b}_{r} }}'
+        )
+    specs_src = ",\n    ".join(spec_rows)
+
+    # 7) helper + spec + funcs
+    helpers = (
+        "/// ---- PEG 런타임(토큰용) ----\n"
+        "/// - 백트래킹/선택/반복/부정전방탐색(!) 지원\n"
+        "/// - 각 규칙은 `fn(s, pos) -> Option<end_pos>` 형태로 생성됨\n"
+        "#[derive(Copy, Clone)]\n"
+        "struct PegSpec {\n"
+        "    name: &'static str,\n"
+        "    trigger: Option<char>,\n"
+        "    func: fn(&str, usize) -> Option<usize>,\n"
+        "}\n\n"
+        "static PEG_SPECS: &[PegSpec] = &[\n"
+        f"    {specs_src}\n"
+        "];\n\n"
+    )
+
+    return helpers + "".join(rust_funcs)
+
+
+
 
 def _lexer_src_from_ast(ast) -> str:
     """
-    간단 러스트 렉서 방출:
-    - 키워드(리터럴) 우선, 유니코드 경계( is_alphanumeric() || '_' )로 단어 키워드 구분
-    - %ignore: /\s+/ 이 있으면 공백/개행 스킵
-    - %token: NUMBER만 내장 스캔(그 외는 렉서 직접 구현 권장)
+    Rust 내장 렉서 방출(PEG 통합판)
+    =================================
+    - 키워드(리터럴) **최장일치 + 단어경계**
+    - %ignore /\s+/ 스킵
+    - %token NUMBER (하드코딩) 스캔
+    - **%token ... %peg(Block.Rule)** 및 **RHS @peg(...) (로워링 후 전역 PEG 토큰) 지원**
+      * PEG는 백트래킹/반복/선택/부정전방탐색(!) 동작
+      * 토큰 단위 최장일치(여러 PEG 토큰 후보 중 가장 긴 것 선택, 동률이면 선언순)
+      * [trigger='x'] 지정 시 시작 문자가 x일 때만 시도
     """
-    kws = sorted({kw.lexeme for kw in ast.decl_keywords}, key=lambda s: (-len(s), s))
+    # --- 키워드: 중복 제거 + 길이 내림차순(동길이면 선언 순서) ---
+    raw_kws = [kw.lexeme for kw in ast.decl_keywords]
+    seen = set(); kws_pairs = []
+    for idx, lit in enumerate(raw_kws):
+        if lit in seen: continue
+        seen.add(lit); kws_pairs.append((lit, idx))
+    kws_pairs.sort(key=lambda p: (-len(p[0]), p[1]))
+    kws = [lit for (lit, _idx) in kws_pairs]
     kws_arr = ", ".join(f"\"{_escape_rs(k)}\"" for k in kws)
+
+    # ignore: /\s+/ 존재 여부
     has_ws_ignore = any(ig.pattern == r"\s+" for ig in ast.decl_ignores)
+
+    # token 이름 수집
     token_names = [td.name for td in ast.decl_tokens]
     has_number = "NUMBER" in token_names
 
+    # PEG 섹션(필요 시) 생성
+    peg_section_src = _peg_emit_rust_from_blocks(ast)
+
+    # 1) skip_ignores 본문
     if has_ws_ignore:
         skip_ignores_code = (
             "while let Some(ch) = self.peek_char() { "
@@ -237,6 +708,7 @@ def _lexer_src_from_ast(ast) -> str:
     else:
         skip_ignores_code = "/* no %ignore /\\s+/; */"
 
+    # 2) match_number 본문
     if has_number:
         match_number_code = """
         // optional sign
@@ -278,11 +750,15 @@ def _lexer_src_from_ast(ast) -> str:
     else:
         match_number_code = "return None;"
 
-    # NEW: 유니코드 경계 판정 헬퍼 및 단어 키워드 판정
+    # 3) 최종 방출
     return f"""
-// ====== Generated Simple Lexer (no external crates) ======
-// 유니코드 경계: 식별자 문자는 `ch.is_alphanumeric() || ch == '_'`로 근사 처리합니다.
-// 제한: 공백 스킵(\\s+), 키워드 리터럴, NUMBER 토큰만 지원합니다.
+// ====== Generated Simple Lexer (PEG-enabled) ======
+// 제한: 공백 스킵(\\s+), 키워드 리터럴(최장일치), NUMBER, PEG 토큰(@peg 포함) 지원
+//  - PEG: 백트래킹/선택/반복/부정전방탐색 지원
+//  - 필요시 trigger='x'로 빠른 가지치기
+//  - 기타 정규식 토큰은 내장 렉서가 지원하지 않습니다.
+
+{peg_section_src}
 
 pub struct SimpleLexer<'a> {{
     text: &'a str,
@@ -294,42 +770,60 @@ impl<'a> SimpleLexer<'a> {{
         Self {{ text: input, i: 0 }}
     }}
 
-    #[inline] fn at_eof(&self) -> bool {{ self.i >= self.text.len() }}
-    #[inline] fn peek_char(&self) -> Option<char> {{ self.text[self.i..].chars().next() }}
-    #[inline] fn advance_by(&mut self, n_bytes: usize) {{ self.i += n_bytes; }}
-    #[inline] fn starts_with_at(&self, s: &str) -> bool {{ self.text[self.i..].as_bytes().starts_with(s.as_bytes()) }}
+    fn at_eof(&self) -> bool {{ self.i >= self.text.len() }}
 
-    #[inline]
+    fn peek_char(&self) -> Option<char> {{ self.text[self.i..].chars().next() }}
+
+    fn advance_by(&mut self, n_bytes: usize) {{
+        self.i += n_bytes;
+    }}
+
+    fn starts_with_at(&self, s: &str) -> bool {{
+        self.text[self.i..].as_bytes().starts_with(s.as_bytes())
+    }}
+
     fn take_while<F: FnMut(char)->bool>(&mut self, mut f: F) -> usize {{
         let mut n = 0usize;
         for ch in self.text[self.i..].chars() {{
-            if f(ch) {{ n += ch.len_utf8(); }} else {{ break; }}
+            if f(ch) {{
+                n += ch.len_utf8();
+            }} else {{
+                break;
+            }}
         }}
         self.advance_by(n);
         n
     }}
 
     #[inline]
-    fn is_ident_continue(ch: char) -> bool {{
-        ch.is_alphanumeric() || ch == '_'
-    }}
-
-    #[inline]
     fn is_word_kw(s: &str) -> bool {{
-        s.chars().any(|c| Self::is_ident_continue(c))
+        s.chars().any(|c| c.is_alphanumeric() || c == '_')
     }}
 
     fn match_keyword(&mut self) -> Option<&'static str> {{
+        // KEYWORDS는 **길이 내림차순(최장일치)** 로 정렬되어 방출됩니다.
         const KEYWORDS: &[&str] = &[{kws_arr}];
         for &kw in KEYWORDS {{
             if self.starts_with_at(kw) {{
-                // '단어 키워드'면 다음 문자가 식별자면 안 됨(유니코드 경계)
+                // 유니코드 단어 경계 검사(앞/뒤 모두)
                 if Self::is_word_kw(kw) {{
+                    // prev boundary
+                    let mut prev_ok = true;
+                    if self.i > 0 {{
+                        if let Some(prev) = self.text[..self.i].chars().rev().next() {{
+                            if prev.is_alphanumeric() || prev == '_' {{ prev_ok = false; }}
+                        }}
+                    }}
+                    // next boundary
                     let after = self.i + kw.len();
+                    let mut next_ok = true;
                     if after < self.text.len() {{
                         if let Some(next) = self.text[after..].chars().next() {{
-                            if Self::is_ident_continue(next) {{ continue; }}
+                            if next.is_alphanumeric() || next == '_' {{ next_ok = false; }}
                         }}
+                    }}
+                    if !(prev_ok && next_ok) {{
+                        continue;
                     }}
                 }}
                 self.advance_by(kw.len());
@@ -343,6 +837,41 @@ impl<'a> SimpleLexer<'a> {{
         {skip_ignores_code}
     }}
 
+    /// 모든 PEG 토큰 후보를 시도하여 **가장 긴 매치**를 선택한다.
+    /// 동률이면 **선언 순서**를 유지한다.
+    fn match_peg(&mut self) -> Option<(&'static str, usize)> {{
+        if PEG_SPECS.is_empty() {{ return None; }}
+        let s = self.text;
+        let start = self.i;
+        let mut best_len: usize = 0;
+        let mut best_name: Option<&'static str> = None;
+
+        for spec in PEG_SPECS {{
+            if let Some(tr) = spec.trigger {{
+                // 트리거 불일치 시 스킵
+                if let Some(ch) = s[start..].chars().next() {{
+                    if ch != tr {{ continue; }}
+                }} else {{
+                    continue;
+                }}
+            }}
+            if let Some(end_pos) = (spec.func)(s, start) {{
+                if end_pos > start {{
+                    let len = end_pos - start;
+                    if len > best_len {{
+                        best_len = len;
+                        best_name = Some(spec.name);
+                    }}
+                }}
+            }}
+        }}
+
+        match best_name {{
+            Some(nm) if best_len > 0 => Some((nm, best_len)),
+            _ => None
+        }}
+    }}
+
     fn match_number(&mut self) -> Option<&'static str> {{
         {match_number_code}
     }}
@@ -353,14 +882,24 @@ impl<'a> Lexer for SimpleLexer<'a> {{
         self.skip_ignores();
         if self.at_eof() {{ return Some(EOF_TERM); }}
 
+        // 1) 키워드
         if let Some(kw) = self.match_keyword() {{
-            // TERM_NAMES에서 id 찾기
             for (i, name) in TERM_NAMES.iter().enumerate() {{
                 if *name == kw {{ return Some(i as u16); }}
             }}
             panic!("keyword not found in TERM_NAMES: {{}}", kw);
         }}
 
+        // 2) PEG 토큰(@peg 포함)
+        if let Some((nm, len)) = self.match_peg() {{
+            self.advance_by(len);
+            for (i, name) in TERM_NAMES.iter().enumerate() {{
+                if *name == nm {{ return Some(i as u16); }}
+            }}
+            panic!("PEG token not found in TERM_NAMES: {{}}", nm);
+        }}
+
+        // 3) NUMBER (하드코딩)
         if let Some(tok) = self.match_number() {{
             for (i, name) in TERM_NAMES.iter().enumerate() {{
                 if *name == tok {{ return Some(i as u16); }}
@@ -368,11 +907,13 @@ impl<'a> Lexer for SimpleLexer<'a> {{
             panic!("token not found in TERM_NAMES: {{}}", tok);
         }}
 
+        // 4) 실패
         let bad = self.text[self.i..].chars().next().unwrap();
         panic!("Lexing error: unsupported token starting with '{{:?}}' at byte {{}}", bad, self.i);
     }}
 }}
 """.lstrip("\n")
+
 
 
 

@@ -29,6 +29,15 @@ from ..grammar.ast import Grammar  # ← (옵션) 전역 %recover/%sync 읽기�
 
 SHIFT, REDUCE, ACCEPT = 1, 2, 3
 
+@dataclass
+class PegTermIR:
+    """PEG 토큰 1개에 대한 IR 메타 정보 (코드 생성용)."""
+    term_id: int          # 단말 ID
+    term_name: str        # 단말 이름(디버그/문서용)
+    block_name: str       # %peg 블록 이름
+    rule_name: str        # %peg 룰 이름
+    trigger: Optional[str] = None  # 선택: 단일 문자 트리거
+
 @dataclass 
 class CodegenIR:
     """
@@ -65,10 +74,14 @@ class CodegenIR:
     action_rows: List[List[Tuple[int, int, int]]]
     goto_rows: List[List[Tuple[int, int]]]
 
-    # --- 신규: 오류 복구 ---
+    # --- 오류 복구 ---
     recover_mode: Optional[str] = None
     sync_term_ids: List[int] = field(default_factory=list)
     max_errors: int = 5
+
+    # --- PEG 메타데이터 for codegen ---
+    peg_blocks: List[Tuple[str, str]] = field(default_factory=list)  # (block_name, src)
+    peg_terms: List[PegTermIR] = field(default_factory=list)
 
 
 def build_ir(sym: SymbolTable, tbl: Tables, g: Optional[Grammar] = None) -> CodegenIR:
@@ -145,6 +158,32 @@ def build_ir(sym: SymbolTable, tbl: Tables, g: Optional[Grammar] = None) -> Code
                     uniq.append(t); seen.add(t)
             sync_term_ids = uniq
 
+    peg_blocks: List[Tuple[str, str]] = []
+    peg_terms: List[PegTermIR] = []
+    if g is not None:
+        # block_name -> src
+        block_src: dict[str, str] = {pb.name: pb.src for pb in getattr(g, "decl_peg_blocks", [])}
+        # term name -> id
+        name_to_tid = {name: i for i, name in enumerate(terms)}
+        # collect
+        for bname, src in block_src.items():
+            peg_blocks.append((bname, src))
+        for pt in getattr(g, "decl_peg_tokens", []):
+            term_name = pt.name
+            try:
+                tid = name_to_tid[term_name]
+            except KeyError:
+                raise ValueError(f"PEG token '{term_name}' is not in terminal set: terms={terms}")
+            peg_terms.append(
+                PegTermIR(
+                    term_id=tid,
+                    term_name=term_name,
+                    block_name=pt.peg_ref[0],
+                    rule_name=pt.peg_ref[1],
+                    trigger=pt.trigger,
+                )
+            )
+
     return CodegenIR(
         n_states=tbl.n_states,
         n_terms=sym.term_count,
@@ -157,8 +196,12 @@ def build_ir(sym: SymbolTable, tbl: Tables, g: Optional[Grammar] = None) -> Code
         action_rows=action_rows,
         goto_rows=goto_rows,
 
-        # 신규 메타
+        # 오류 복구
         recover_mode=recover_mode,
         sync_term_ids=sync_term_ids,
         max_errors=5,
+
+        # PEG meta for codegen
+        peg_blocks=peg_blocks,
+        peg_terms=peg_terms,
     )

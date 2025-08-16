@@ -178,7 +178,11 @@ def cmd_build(args) -> int:
     elif args.lang == "c":
         from .codegen.emit_c import emit_c_to_string
         module_name = args.module or _sanitize_rs_mod_name(out_path.name)
-        src = emit_c_to_string(ir, module_name=module_name)
+        src = emit_c_to_string(
+            ir,
+            module_name=module_name,
+            lexer_ast=(g if args.with_lexer else None),
+        )
         out_path.write_text(src, encoding="utf-8")
         print(f"[EMIT] parser={args.parser} lang=c -> {out_path}")
         if args.debug:
