@@ -15,6 +15,7 @@ import regex as re
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 from .ast import *
+import ast as _pyast
 
 # ---- Lexer 토큰 ----
 _TOKEN_SPEC = [
@@ -161,10 +162,11 @@ class _TS:
         return t
 
 def _unquote_string(s: str) -> str:
-    return bytes(s[1:-1], "utf-8").decode("unicode_escape")
+    # s는 따옴표를 포함한 토큰 원문("..."). Python의 안전한 리터럴 파서로 정확히 복원.
+    return _pyast.literal_eval(s)
 
 def _unquote_sstring(s: str) -> str:
-    return bytes(s[1:-1], "utf-8").decode("unicode_escape")
+    return _pyast.literal_eval(s)
 
 def _strip_regex(s: str) -> Tuple[str, str]:
     last = s.rfind("/")
